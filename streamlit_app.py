@@ -116,7 +116,7 @@ def show_dashboard(df):
         st.markdown("""
         <div class="stats-card">
             <h3>🎬 Film Totali</h3>
-            <h2>{:,}</h2>
+            <h2>{:,} film</h2>
         </div>
         """.format(len(df)), unsafe_allow_html=True)
     
