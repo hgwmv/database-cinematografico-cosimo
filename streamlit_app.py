@@ -197,21 +197,30 @@ def show_search(df):
     st.subheader(f"📋 Risultati ({len(filtered_df)} film)")
     
     if len(filtered_df) > 0:
-        # Ordina per rating decrescente
-        filtered_df = filtered_df.sort_values('Rating_Clean', ascending=False, na_last=True)
+        # Ordina per rating decrescente - FIX per l'errore
+        if 'Rating_Clean' in filtered_df.columns and not filtered_df['Rating_Clean'].isna().all():
+            filtered_df = filtered_df.sort_values('Rating_Clean', ascending=False, na_last=True)
+        else:
+            # Se non ci sono rating validi, ordina per nome
+            filtered_df = filtered_df.sort_values('Name', na_last=True)
         
         for i, (_, film) in enumerate(filtered_df.head(50).iterrows(), 1):
+            # Gestione sicura dei valori che potrebbero essere None/NaN
             rating = film['Rating_Clean'] if pd.notna(film['Rating_Clean']) else 'N/A'
             year = f" ({int(film['Year_Clean'])})" if pd.notna(film['Year_Clean']) else ""
             duration = f" | ⏱️ {int(film['Duration_Clean'])}min" if pd.notna(film['Duration_Clean']) else ""
             
-            # Evidenzia great movies
-            title_style = "font-weight: bold; color: #FF6B6B;" if pd.notna(film['Rating_Clean']) and film['Rating_Clean'] >= 7.5 else ""
+            # Gestione sicura del nome e regista
+            film_name = film['Name'] if pd.notna(film['Name']) else 'Film senza titolo'
+            director_name = film['Director'] if pd.notna(film['Director']) else 'Regista sconosciuto'
+            
+            # Evidenzia great movies solo se il rating è un numero valido
+            title_style = "font-weight: bold; color: #FF6B6B;" if (pd.notna(film['Rating_Clean']) and float(str(rating).replace('N/A', '0')) >= 7.5) else ""
             
             st.markdown(f"""
             <div class="film-card">
-                <span style="{title_style}">{i}. {film['Name']}</span>{year}<br>
-                <small>🎭 {film['Director']} | ⭐ {rating}/10{duration}</small>
+                <span style="{title_style}">{i}. {film_name}</span>{year}<br>
+                <small>🎭 {director_name} | ⭐ {rating}/10{duration}</small>
             </div>
             """, unsafe_allow_html=True)
         
@@ -222,14 +231,15 @@ def show_top_films(df):
     """Top film per anno/decade"""
     st.header("🏆 Top Film")
     
-    tab1, tab2, tab3 = st.tabs(["📅 Per Anno", "📊 Per Decennio", "🌟 Migliori Assoluti"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📅 Per Anno", "📊 Per Decennio", "🌟 Film 10/10", "🎬 Great Movies"])
     
     with tab1:
         col1, col2 = st.columns(2)
         with col1:
-            selected_year = st.selectbox("Scegli anno:", sorted(df['Year_Clean'].dropna().unique(), reverse=True))
+            years_list = sorted([int(year) for year in df['Year_Clean'].dropna().unique()], reverse=True)
+            selected_year = st.selectbox("Scegli anno:", years_list)
         with col2:
-            top_n = st.slider("Numero film:", 5, 50, 10)
+            top_n = st.slider("Numero film:", 5, 100, 10)
         
         if selected_year:
             year_films = df[df['Year_Clean'] == selected_year]
@@ -249,16 +259,20 @@ def show_top_films(df):
                     """, unsafe_allow_html=True)
     
     with tab2:
-        decades = list(range(1920, 2030, 10))
-        selected_decade = st.selectbox("Scegli decennio:", decades, index=len(decades)-3)
+        col1, col2 = st.columns(2)
+        with col1:
+            decades = list(range(1920, 2030, 10))
+            selected_decade = st.selectbox("Scegli decennio:", decades, index=len(decades)-3)
+        with col2:
+            top_n_decade = st.slider("Numero film:", 5, 100, 15, key="decade_slider")
         
         decade_films = df[(df['Year_Clean'] >= selected_decade) & (df['Year_Clean'] < selected_decade + 10)]
         decade_films_rated = decade_films[decade_films['Rating_Clean'].notna()]
         
         if len(decade_films_rated) > 0:
-            top_decade = decade_films_rated.nlargest(15, 'Rating_Clean')
+            top_decade = decade_films_rated.nlargest(top_n_decade, 'Rating_Clean')
             
-            st.subheader(f"🏆 Top Film anni {selected_decade}s")
+            st.subheader(f"🏆 Top {top_n_decade} Film anni {selected_decade}s")
             
             for i, (_, film) in enumerate(top_decade.iterrows(), 1):
                 year = f" ({int(film['Year_Clean'])})" if pd.notna(film['Year_Clean']) else ""
@@ -270,19 +284,64 @@ def show_top_films(df):
                 """, unsafe_allow_html=True)
     
     with tab3:
+        # Film con voto 10/10
         df_rated = df[df['Rating_Clean'].notna()]
-        top_absolute = df_rated.nlargest(25, 'Rating_Clean')
+        perfect_films = df_rated[df_rated['Rating_Clean'] == 10.0]
         
-        st.subheader("🌟 I 25 Migliori Film di Sempre")
+        if len(perfect_films) > 0:
+            # Ordina per anno (cronologico)
+            perfect_films_sorted = perfect_films.sort_values('Year_Clean', ascending=True)
+            
+            st.subheader(f"🌟 I Miei Film 10/10 ({len(perfect_films)} film)")
+            
+            for i, (_, film) in enumerate(perfect_films_sorted.iterrows(), 1):
+                year = f" ({int(film['Year_Clean'])})" if pd.notna(film['Year_Clean']) else ""
+                st.markdown(f"""
+                <div class="film-card">
+                    <strong>{i}. {film['Name']}</strong>{year}<br>
+                    <small>🎭 {film['Director']} | ⭐ {film['Rating_Clean']}/10</small>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("Nessun film con voto 10/10 trovato nel database")
+    
+    with tab4:
+        # Great Movies (7.5+)
+        df_rated = df[df['Rating_Clean'].notna()]
+        great_films = df_rated[df_rated['Rating_Clean'] >= 7.5]
         
-        for i, (_, film) in enumerate(top_absolute.iterrows(), 1):
-            year = f" ({int(film['Year_Clean'])})" if pd.notna(film['Year_Clean']) else ""
-            st.markdown(f"""
-            <div class="film-card">
-                <strong>{i}. {film['Name']}</strong>{year}<br>
-                <small>🎭 {film['Director']} | ⭐ {film['Rating_Clean']}/10</small>
-            </div>
-            """, unsafe_allow_html=True)
+        if len(great_films) > 0:
+            # Ordina per anno (cronologico)
+            great_films_sorted = great_films.sort_values('Year_Clean', ascending=True)
+            
+            st.subheader(f"🎬 Great Movies - 7.5+ ({len(great_films)} film)")
+            
+            # Mostra con paginazione ogni 50 film
+            films_per_page = 50
+            total_pages = (len(great_films_sorted) + films_per_page - 1) // films_per_page
+            
+            if total_pages > 1:
+                page = st.selectbox("Pagina:", range(1, total_pages + 1))
+                start_idx = (page - 1) * films_per_page
+                end_idx = start_idx + films_per_page
+                films_to_show = great_films_sorted.iloc[start_idx:end_idx]
+            else:
+                films_to_show = great_films_sorted
+            
+            for i, (_, film) in enumerate(films_to_show.iterrows(), 1):
+                year = f" ({int(film['Year_Clean'])})" if pd.notna(film['Year_Clean']) else ""
+                rating = film['Rating_Clean']
+                st.markdown(f"""
+                <div class="film-card">
+                    <strong>{film['Name']}</strong>{year}<br>
+                    <small>🎭 {film['Director']} | ⭐ {rating}/10</small>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            if total_pages > 1:
+                st.info(f"Pagina {page} di {total_pages} - {len(great_films)} great movies totali")
+        else:
+            st.info("Nessun Great Movie (7.5+) trovato nel database")
 
 def show_directors_analysis(df):
     """Analisi registi"""
@@ -380,11 +439,163 @@ def show_directors_analysis(df):
 def show_companions_analysis(df):
     """Analisi film visti in compagnia"""
     st.header("👥 Film in Compagnia")
-    st.info("Questa sezione richiede i tag diario nel CSV per funzionare completamente")
     
-    # Placeholder per l'analisi compagni
-    st.subheader("🔜 Funzionalità in arrivo")
-    st.write("L'analisi dei compagni verrà implementata quando i tag diario saranno disponibili nel dataset.")
+    # Controlla se esiste la colonna tag diario
+    tag_column = None
+    possible_columns = ['Tag Diario', 'tag diario', 'Tag_Diario', 'tag_diario', 'Diario Tag', 'diario_tag']
+    
+    for col in df.columns:
+        if any(tag_col.lower() in col.lower() for tag_col in possible_columns):
+            tag_column = col
+            break
+    
+    if not tag_column:
+        st.error("❌ Colonna 'Tag Diario' non trovata nel database")
+        st.info("💡 Colonne disponibili nel CSV:")
+        st.write(list(df.columns))
+        return
+    
+    st.info(f"📊 Analizzando la colonna: '{tag_column}'")
+    
+    # Dizionario dei compagni
+    companions = {
+        'c:c': 'Claudia (mamma)',
+        'c:a': 'Ale (babbo)', 
+        'c:p': 'Priamo',
+        'c:r': 'Rebecca',
+        'c:k': 'Kenta',
+        'd:m': 'Marco Grifò',
+        'c:mo': 'Monica',
+        'd:p': 'Priamo',
+        'c:av': 'Alessandro Valenti',
+        'd:r': 'Rebecca',
+        'd:k': 'Kenta', 
+        'c:m': 'Marco Grifò',
+        'd:l': 'Leonardo Romagnoli',
+        'c:l': 'Leonardo Romagnoli',
+        'c:d': 'Dario',
+        'd:sm': 'Simone Malaspina',
+        'c:sm': 'Simone Malaspina',
+        'd:av': 'Alessandro Valenti',
+        'd:d': 'Dario'
+    }
+    
+    # Trova film con tag di compagnia
+    companion_films = {}
+    
+    for tag, name in companions.items():
+        # Cerca film che contengono questo tag
+        mask = df[tag_column].astype(str).str.contains(tag, case=False, na=False)
+        films = df[mask].copy()
+        
+        if len(films) > 0:
+            if name not in companion_films:
+                companion_films[name] = pd.DataFrame()
+            
+            # Unisci i film senza duplicati
+            companion_films[name] = pd.concat([companion_films[name], films]).drop_duplicates()
+    
+    if not companion_films:
+        st.warning("❌ Nessun film trovato con tag di compagnia")
+        st.info("💡 Tags cercati: c:c, c:a, c:p, c:r, d:m, etc.")
+        
+        # Mostra esempi di contenuti nella colonna tag
+        sample_tags = df[tag_column].dropna().head(10)
+        if len(sample_tags) > 0:
+            st.info("📝 Esempi di contenuti nella colonna tag:")
+            for tag in sample_tags:
+                st.write(f"- '{tag}'")
+        return
+    
+    # Calcola statistiche
+    all_companion_film_indices = set()
+    for films in companion_films.values():
+        all_companion_film_indices.update(films.index)
+    
+    total_companion_films = len(all_companion_film_indices)
+    total_films = len(df)
+    companion_percentage = (total_companion_films / total_films) * 100
+    
+    # Statistiche generali
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("🎬 Film Totali", f"{total_films:,}")
+    with col2:
+        st.metric("👥 Film in Compagnia", f"{total_companion_films:,}")
+    with col3:
+        st.metric("📈 Percentuale", f"{companion_percentage:.1f}%")
+    
+    # Top compagni
+    companion_counts = [(name, len(films)) for name, films in companion_films.items()]
+    companion_counts.sort(key=lambda x: x[1], reverse=True)
+    
+    st.subheader("🏆 Classifica Compagni di Visione")
+    
+    for i, (name, count) in enumerate(companion_counts, 1):
+        films = companion_films[name]
+        films_with_rating = films[films['Rating_Clean'].notna()]
+        
+        if len(films_with_rating) > 0:
+            avg_rating = films_with_rating['Rating_Clean'].mean()
+            great_movies = len(films_with_rating[films_with_rating['Rating_Clean'] >= 7.5])
+            rating_info = f" | ⭐ {avg_rating:.2f}/10 | 🏆 {great_movies} great movies"
+        else:
+            rating_info = " | ⭐ N/A"
+        
+        percentage = (count / total_companion_films) * 100
+        st.markdown(f"""
+        <div class="film-card">
+            <strong>{i}. {name}</strong><br>
+            <small>🎬 {count} film ({percentage:.1f}%){rating_info}</small>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Dettagli per compagno selezionato
+    st.subheader("🔍 Dettagli Compagno")
+    selected_companion = st.selectbox("Scegli un compagno:", list(companion_films.keys()))
+    
+    if selected_companion:
+        films = companion_films[selected_companion]
+        films_with_rating = films[films['Rating_Clean'].notna()]
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("🎬 Film Insieme", len(films))
+        with col2:
+            if len(films_with_rating) > 0:
+                avg_rating = films_with_rating['Rating_Clean'].mean()
+                st.metric("⭐ Rating Medio", f"{avg_rating:.2f}/10")
+            else:
+                st.metric("⭐ Rating Medio", "N/A")
+        with col3:
+            great_movies = len(films_with_rating[films_with_rating['Rating_Clean'] >= 7.5])
+            st.metric("🏆 Great Movies", great_movies)
+        
+        # Lista film con questo compagno
+        if len(films_with_rating) > 0:
+            st.subheader(f"🎬 Film visti con {selected_companion}")
+            
+            # Ordina per rating decrescente
+            top_films = films_with_rating.sort_values('Rating_Clean', ascending=False)
+            
+            for i, (_, film) in enumerate(top_films.head(20).iterrows(), 1):
+                rating = film['Rating_Clean']
+                year = f" ({int(film['Year_Clean'])})" if pd.notna(film['Year_Clean']) else ""
+                director = film['Director'] if pd.notna(film['Director']) else "Sconosciuto"
+                
+                title_style = "font-weight: bold; color: #FF6B6B;" if rating >= 7.5 else ""
+                
+                st.markdown(f"""
+                <div class="film-card">
+                    <span style="{title_style}">{i}. {film['Name']}</span>{year}<br>
+                    <small>🎭 {director} | ⭐ {rating}/10</small>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            if len(top_films) > 20:
+                st.info(f"Mostrati i primi 20 di {len(top_films)} film con rating")
 
 def show_charts(df):
     """Grafici e visualizzazioni"""
@@ -396,18 +607,35 @@ def show_charts(df):
         df_valid = df[df['Rating_Clean'].notna()]
         
         if len(df_valid) > 0:
-            fig, ax = plt.subplots(figsize=(10, 6))
+            fig, ax = plt.subplots(figsize=(12, 8))
             
-            # Istogramma rating
-            ax.hist(df_valid['Rating_Clean'], bins=20, alpha=0.7, color='lightblue', edgecolor='black')
-            ax.axvline(df_valid['Rating_Clean'].mean(), color='red', linestyle='--', 
-                      label=f'Media: {df_valid["Rating_Clean"].mean():.2f}')
+            # Arrotondo per difetto i rating (come nel codice originale)
+            df_simplified = df_valid.copy()
+            df_simplified['Rating_Simplified'] = df_valid['Rating_Clean'].apply(lambda x: int(x))
             
-            ax.set_xlabel('Rating')
-            ax.set_ylabel('Numero Film')
-            ax.set_title('Distribuzione Rating Film')
+            # Creo bins per voti interi da 2 a 10 (incluso)
+            bins = list(range(2, 11)) + [11]  # Da 2 a 11, così il bin 10 include i voti 10.0
+            
+            ax.hist(df_simplified['Rating_Simplified'], bins=bins, alpha=0.7, color='lightblue', 
+                    edgecolor='black', width=0.8, align='left')
+            
+            # Statistiche sui voti semplificati
+            mean_rating = df_simplified['Rating_Simplified'].mean()
+            median_rating = df_simplified['Rating_Simplified'].median()
+            
+            # Linee statistiche
+            ax.axvline(mean_rating, color='red', linestyle='--', linewidth=2, label=f'Media: {mean_rating:.1f}')
+            ax.axvline(median_rating, color='green', linestyle='--', linewidth=2, label=f'Mediana: {median_rating:.0f}')
+            
+            ax.set_xlabel('Rating (voti interi)')
+            ax.set_ylabel('Numero di Film')
+            ax.set_title('📊 Distribuzione Rating Film')
             ax.legend()
             ax.grid(True, alpha=0.3)
+            
+            # Imposta i tick per voti interi da 2 a 10
+            ax.set_xticks(range(2, 11))
+            ax.set_xlim(1.5, 10.5)  # Limiti per centrare le barre
             
             st.pyplot(fig)
             
@@ -416,13 +644,25 @@ def show_charts(df):
             col1, col2, col3, col4 = st.columns(4)
             
             with col1:
-                st.metric("Media", f"{df_valid['Rating_Clean'].mean():.2f}")
+                st.metric("Media", f"{mean_rating:.1f}")
             with col2:
-                st.metric("Mediana", f"{df_valid['Rating_Clean'].median():.2f}")
+                st.metric("Mediana", f"{median_rating:.0f}")
             with col3:
-                st.metric("Max", f"{df_valid['Rating_Clean'].max():.1f}")
+                st.metric("Max", f"{df_simplified['Rating_Simplified'].max()}")
             with col4:
-                st.metric("Min", f"{df_valid['Rating_Clean'].min():.1f}")
+                st.metric("Min", f"{df_simplified['Rating_Simplified'].min()}")
+            
+            # Statistiche aggiuntive
+            great_movies = len(df_valid[df_valid['Rating_Clean'] >= 7.5])
+            great_percentage = (great_movies / len(df_valid)) * 100
+            
+            st.markdown(f"""
+            <div class="stats-card">
+                <h4>🏆 Great Movies (7.5+)</h4>
+                <h3>{great_movies} film ({great_percentage:.1f}%)</h3>
+                <p>📊 Film totali con rating: {len(df_valid)}</p>
+            </div>
+            """, unsafe_allow_html=True)
     
     with tab2:
         df_timeline = df[df['Watch_Date'].notna()]
@@ -461,8 +701,8 @@ def show_temporal_analysis(df):
     
     with tab1:
         # Selezione anno
-        years_available = sorted(df['Year_Clean'].dropna().unique(), reverse=True)
-        selected_year = st.selectbox("Analizza anno:", years_available)
+        years_available = sorted([int(year) for year in df['Year_Clean'].dropna().unique()], reverse=True)
+        selected_year = st.selectbox("Scegli anno:", years_available)
         
         if selected_year:
             year_films = df[df['Year_Clean'] == selected_year]
