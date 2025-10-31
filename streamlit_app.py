@@ -4,10 +4,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 from datetime import datetime
-import warnings
 import os
 import time
 from typing import Optional
+import html  # For XSS prevention
 try:
     import requests
 except Exception:
@@ -22,6 +22,24 @@ st.set_page_config(
     page_icon=None,
     layout="wide"
 )
+
+# =====================================
+# GLOBAL CONFIGURATION
+# =====================================
+# Helper to safely get secrets (defined here to avoid circular dependency)
+def _get_secret_early(key: str, default=None):
+    """Get secret safely before full initialization"""
+    try:
+        return st.secrets[key]
+    except Exception:
+        return default
+
+# CSV file path configuration
+CSV_BASE_FILE = _get_secret_early("CSV_BASE_FILE", os.environ.get("CSV_BASE_FILE", 'cosimo-film-visti-excel.csv'))
+
+# Application constants
+FEATURE_FILM_MIN_DURATION = 40  # Minimum duration (minutes) to be considered a feature film
+GREAT_MOVIE_MIN_RATING = 7.5    # Minimum rating to be classified as a "Great Movie"
 
 # =====================================
 # THEMES (original vs early web)
@@ -137,22 +155,43 @@ def load_database(csv_path: str, mtime: float):
     """Carica il database con caching, invalida se cambia il file (mtime)."""
     try:
         df = pd.read_csv(csv_path, sep=';', encoding='cp1252')
-        
+
         # Pulizia dati
         df['Rating_Clean'] = pd.to_numeric(df['Rating 10'].str.replace(',', '.'), errors='coerce')
         df['Year_Clean'] = pd.to_numeric(df['Year'], errors='coerce')
         df['Duration_Clean'] = pd.to_numeric(df['Duration'], errors='coerce')
         df['Watch_Date'] = pd.to_datetime(df['Watched Date'], format='%d/%m/%Y', errors='coerce')
-        
+
         return df
+    except FileNotFoundError:
+        st.error(f"File database non trovato: {csv_path}")
+        st.info("Crea un nuovo file CSV o verifica il percorso configurato.")
+        return pd.DataFrame()
+    except pd.errors.ParserError as e:
+        st.error(f"Errore nel parsing del CSV: {e}")
+        st.info("Verifica che il file sia un CSV valido con separatore ';' e encoding cp1252.")
+        return pd.DataFrame()
+    except UnicodeDecodeError:
+        st.error(f"Errore di encoding del file: {csv_path}")
+        st.info("Il file potrebbe non essere in encoding cp1252. Prova a convertirlo.")
+        return pd.DataFrame()
+    except KeyError as e:
+        st.error(f"Colonna mancante nel database: {e}")
+        st.info("Verifica che il CSV contenga tutte le colonne richieste: Name, Year, Rating 10, Duration, Director, Watched Date.")
+        return pd.DataFrame()
     except Exception as e:
-        st.error(f"Errore nel caricamento del database: {e}")
+        st.error(f"Errore imprevisto nel caricamento del database: {e}")
         return pd.DataFrame()
 
 # =====================================
 # RENDER HELPERS (no emojis)
 # =====================================
 def render_film_card(index=None, title="", director=None, year=None, rating=None, duration=None, date=None, highlight=False):
+    # Sanitize user data to prevent XSS
+    title = html.escape(str(title))
+    director = html.escape(str(director)) if director else None
+    date = html.escape(str(date)) if date else None
+
     year_txt = f" ({int(year)})" if pd.notna(year) else ""
     parts = []
     if director:
@@ -334,8 +373,8 @@ def show_dashboard(df):
     col1, col2, col3, col4 = st.columns(4)
     
     df_valid = df[df['Rating_Clean'].notna()]
-    df_features = df[df['Duration_Clean'] >= 40]
-    df_shorts = df[df['Duration_Clean'] < 40]
+    df_features = df[df['Duration_Clean'] >= FEATURE_FILM_MIN_DURATION]
+    df_shorts = df[df['Duration_Clean'] < FEATURE_FILM_MIN_DURATION]
     
     with col1:
         st.markdown("""
@@ -355,7 +394,7 @@ def show_dashboard(df):
         """.format(avg_rating), unsafe_allow_html=True)
     
     with col3:
-        great_movies = len(df_valid[df_valid['Rating_Clean'] >= 7.5])
+        great_movies = len(df_valid[df_valid['Rating_Clean'] >= GREAT_MOVIE_MIN_RATING])
         st.markdown("""
         <div class="stats-card">
             <h3>Great Movies</h3>
@@ -440,7 +479,7 @@ def show_search(df):
         
         for i, (_, film) in enumerate(filtered_df.head(50).iterrows(), 1):
             rating = film['Rating_Clean'] if pd.notna(film['Rating_Clean']) else None
-            highlight = (rating is not None and float(rating) >= 7.5)
+            highlight = (rating is not None and float(rating) >= GREAT_MOVIE_MIN_RATING)
             render_film_card(
                 index=i,
                 title=film['Name'] if pd.notna(film['Name']) else "Titolo sconosciuto",
@@ -538,7 +577,7 @@ def show_top_films(df):
     with tab4:
         # Great Movies (7.5+)
         df_rated = df[df['Rating_Clean'].notna()]
-        great_films = df_rated[df_rated['Rating_Clean'] >= 7.5]
+        great_films = df_rated[df_rated['Rating_Clean'] >= GREAT_MOVIE_MIN_RATING]
         
         if len(great_films) > 0:
             # Ordina per anno (cronologico)
@@ -600,9 +639,11 @@ def show_directors_analysis(df):
                 return value
         
         return director
-    
+
+    # Create explicit copy to avoid SettingWithCopyWarning
+    df = df.copy()
     df['Director_Normalized'] = df['Director'].apply(normalize_director_name)
-    df_features = df[df['Duration_Clean'] >= 40]
+    df_features = df[df['Duration_Clean'] >= FEATURE_FILM_MIN_DURATION]
     
     tab1, tab2 = st.tabs(["Classifiche Registi", "Dettagli Regista"])
     
@@ -617,10 +658,10 @@ def show_directors_analysis(df):
             director_films = df_features[df_features['Director_Normalized'] == director]
             director_films_rated = director_films[director_films['Rating_Clean'].notna()]
             avg_rating = director_films_rated['Rating_Clean'].mean() if len(director_films_rated) > 0 else 0
-            great_movies = len(director_films_rated[director_films_rated['Rating_Clean'] >= 7.5])
+            great_movies = len(director_films_rated[director_films_rated['Rating_Clean'] >= GREAT_MOVIE_MIN_RATING])
             st.markdown(f"""
             <div class="film-card">
-                <strong>{i}. {director}</strong><br>
+                <strong>{i}. {html.escape(str(director))}</strong><br>
                 <small>Film: {count} | Rating medio: {avg_rating:.2f}/10 | Great: {great_movies}</small>
             </div>""", unsafe_allow_html=True)
     
@@ -642,7 +683,7 @@ def show_directors_analysis(df):
                 avg_rating = director_films_rated['Rating_Clean'].mean() if len(director_films_rated) > 0 else 0
                 st.metric("Rating Medio", f"{avg_rating:.2f}/10")
             with col3:
-                great_movies = len(director_films_rated[director_films_rated['Rating_Clean'] >= 7.5])
+                great_movies = len(director_films_rated[director_films_rated['Rating_Clean'] >= GREAT_MOVIE_MIN_RATING])
                 st.metric("Great Movies", great_movies)
             
             # Filmografia
@@ -655,10 +696,10 @@ def show_directors_analysis(df):
                     rating = film['Rating_Clean']
                     year = f" ({int(film['Year_Clean'])})" if pd.notna(film['Year_Clean']) else ""
                     duration = f" - {int(film['Duration_Clean'])}min" if pd.notna(film['Duration_Clean']) else ""
-                    title_style = "font-weight: bold; color: var(--accent);" if rating >= 7.5 else ""
+                    title_style = "font-weight: bold; color: var(--accent);" if rating >= GREAT_MOVIE_MIN_RATING else ""
                     st.markdown(f"""
                     <div class="film-card">
-                        <span style="{title_style}">{film['Name']}</span>{year}{duration}<br>
+                        <span style="{title_style}">{html.escape(str(film['Name']))}</span>{year}{duration}<br>
                         <small>Rating: {rating}/10</small>
                     </div>
                     """, unsafe_allow_html=True)
@@ -685,7 +726,7 @@ def show_companions_analysis(df):
         st.write(list(df.columns))
         return
     
-    st.info(f"📊 Analizzando la colonna: '{tag_column}'")
+    st.info(f"Analizzando la colonna: '{tag_column}'")
     
     # Dizionario dei compagni
     companions = {
@@ -768,7 +809,7 @@ def show_companions_analysis(df):
         
         if len(films_with_rating) > 0:
             avg_rating = films_with_rating['Rating_Clean'].mean()
-            great_movies = len(films_with_rating[films_with_rating['Rating_Clean'] >= 7.5])
+            great_movies = len(films_with_rating[films_with_rating['Rating_Clean'] >= GREAT_MOVIE_MIN_RATING])
             rating_info = f" | Rating medio: {avg_rating:.2f}/10 | Great: {great_movies}"
         else:
             rating_info = " | Rating medio: N/A"
@@ -776,7 +817,7 @@ def show_companions_analysis(df):
         percentage = (count / total_companion_films) * 100
         st.markdown(f"""
         <div class="film-card">
-            <strong>{i}. {name}</strong><br>
+            <strong>{i}. {html.escape(str(name))}</strong><br>
             <small>Film: {count} ({percentage:.1f}%) {rating_info}</small>
         </div>""", unsafe_allow_html=True)
     
@@ -799,7 +840,7 @@ def show_companions_analysis(df):
             else:
                 st.metric("Rating Medio", "N/A")
         with col3:
-            great_movies = len(films_with_rating[films_with_rating['Rating_Clean'] >= 7.5])
+            great_movies = len(films_with_rating[films_with_rating['Rating_Clean'] >= GREAT_MOVIE_MIN_RATING])
             st.metric("Great Movies", great_movies)
         
         # Lista film con questo compagno
@@ -880,7 +921,7 @@ def show_charts(df):
                 st.metric("Min", f"{df_simplified['Rating_Simplified'].min()}")
             
             # Statistiche aggiuntive
-            great_movies = len(df_valid[df_valid['Rating_Clean'] >= 7.5])
+            great_movies = len(df_valid[df_valid['Rating_Clean'] >= GREAT_MOVIE_MIN_RATING])
             great_percentage = (great_movies / len(df_valid)) * 100
             
             st.markdown(f"""
@@ -935,7 +976,7 @@ def show_temporal_analysis(df):
     df_watched['Watch_Month'] = df_watched['Watch_Date'].dt.month
 
     # Usa solo lungometraggi per i conteggi per anno
-    df_watched_features = df_watched[df_watched['Duration_Clean'] >= 40]
+    df_watched_features = df_watched[df_watched['Duration_Clean'] >= FEATURE_FILM_MIN_DURATION]
 
     tab1, tab2 = st.tabs(["Per Anno di Visione", "Tendenze (anni di visione)"])
 
@@ -953,7 +994,7 @@ def show_temporal_analysis(df):
             avg_rating = year_films_rated['Rating_Clean'].mean() if len(year_films_rated) > 0 else 0
             st.metric("Rating medio", f"{avg_rating:.2f}")
         with col3:
-            great_movies = len(year_films_rated[year_films_rated['Rating_Clean'] >= 7.5])
+            great_movies = len(year_films_rated[year_films_rated['Rating_Clean'] >= GREAT_MOVIE_MIN_RATING])
             st.metric("Great Movies", great_movies)
         with col4:
             if len(year_films_rated) > 0:
@@ -972,7 +1013,7 @@ def show_temporal_analysis(df):
             ax.set_xticks(range(0,12))
             ax.set_xticklabels([months_labels[m] for m in range(1,13)], rotation=0)
             ax.set_ylabel("Film")
-            ax.set_xlabel("Mese")  # ← cambiato (rimosso 'Watch_Month')
+            ax.set_xlabel("Mese")
             ax.set_title(f"Film visti per mese - {selected_year}")
             st.pyplot(fig)
 
@@ -991,11 +1032,11 @@ def show_temporal_analysis(df):
                 rating = film['Rating_Clean']
                 watch_date = film['Watch_Date'].strftime('%d/%m/%Y')
                 year_out = f" ({int(film['Year_Clean'])})" if pd.notna(film['Year_Clean']) else ""
-                style = "font-weight:bold;color: var(--accent);" if rating >= 7.5 else ""
+                style = "font-weight:bold;color: var(--accent);" if rating >= GREAT_MOVIE_MIN_RATING else ""
                 st.markdown(f"""
                 <div class="film-card">
-                    <span style="{style}">{i}. {film['Name']}</span>{year_out}<br>
-                    <small>Regia: {film.get('Director', 'Sconosciuto')} | Rating: {rating:.1f}/10 | Data: {watch_date}</small>
+                    <span style="{style}">{i}. {html.escape(str(film['Name']))}</span>{year_out}<br>
+                    <small>Regia: {html.escape(str(film.get('Director', 'Sconosciuto')))} | Rating: {rating:.1f}/10 | Data: {watch_date}</small>
                 </div>""", unsafe_allow_html=True)
             if len(year_films_rated) > 30:
                 st.info(f"Mostrati 30 di {len(year_films_rated)} film con rating.")
@@ -1007,7 +1048,7 @@ def show_temporal_analysis(df):
             film=('Name','count'),
             rated=('Rating_Clean', lambda s: s.notna().sum()),
             avg_rating=('Rating_Clean','mean'),
-            great=('Rating_Clean', lambda s: (s >= 7.5).sum())
+            great=('Rating_Clean', lambda s: (s >= GREAT_MOVIE_MIN_RATING).sum())
         ).sort_index()
 
         colA, colB = st.columns(2)
@@ -1043,8 +1084,6 @@ def show_temporal_analysis(df):
 # =====================================
 # ADD FILM FEATURE
 # =====================================
-CSV_BASE_FILE = _get_secret("CSV_BASE_FILE", os.environ.get("CSV_BASE_FILE", 'cosimo-film-visti-excel.csv'))
-
 from math import floor
 import io
 
@@ -1163,7 +1202,7 @@ def show_add_film():
             df['Watched Date'] = dt.dt.strftime('%d/%m/%Y')
             df['Tag Diario'] = df['Tag Diario'].astype(str).fillna('').str.strip()
             # Greatness
-            df['Greatness'] = ((r10 >= 7.5).astype(int)).fillna(0)
+            df['Greatness'] = ((r10 >= GREAT_MOVIE_MIN_RATING).astype(int)).fillna(0)
             # Rating as string with comma
             def _fmt(v):
                 if v is None or pd.isna(v):
@@ -1200,7 +1239,12 @@ def show_add_film():
                         return f"{str(s['Name']).strip().lower()}|{y}"
                     prep['_key'] = prep.apply(kbuild, axis=1)
                     if not base.empty:
-                        base['_key'] = base.apply(lambda s: f"{str(s['Name']).strip().lower()}|{int(pd.to_numeric(s['Year'], errors='coerce')) if pd.notna(pd.to_numeric(s['Year'], errors='coerce')) else None}", axis=1)
+                        # Avoid calling pd.to_numeric twice per row
+                        def make_base_key(s):
+                            year_val = pd.to_numeric(s['Year'], errors='coerce')
+                            year_int = int(year_val) if pd.notna(year_val) else None
+                            return f"{str(s['Name']).strip().lower()}|{year_int}"
+                        base['_key'] = base.apply(make_base_key, axis=1)
                     added = 0; updated = 0; skipped = 0
                     if base.empty:
                         out = prep.drop(columns=['_key'])
@@ -1273,7 +1317,7 @@ def show_add_film():
                 duration = st.number_input("Durata (min)", min_value=1, max_value=1000, value=90, step=1)
             with col2:
                 director = st.text_input("Regista", "")
-                watched_date = st.date_input("Data visione", value=None, format="DD/MM/YYYY")
+                watched_date = st.date_input("Data visione", format="DD/MM/YYYY")
                 tag_diario = st.text_input("Tag Diario", "")
             with col3:
                 rating10 = st.number_input("Rating 10 (0-10)", min_value=0.0, max_value=10.0, value=0.0, step=0.5)
@@ -1301,7 +1345,7 @@ def show_add_film():
 
             rating10_str = (str(rating10).replace('.', ','))
             watch_date_str = watched_date.strftime('%d/%m/%Y') if watched_date else ""
-            greatness = 1 if rating10 >= 7.5 else 0
+            greatness = 1 if rating10 >= GREAT_MOVIE_MIN_RATING else 0
             row = {
                 "Name": name.strip(),
                 "Year": int(year),
