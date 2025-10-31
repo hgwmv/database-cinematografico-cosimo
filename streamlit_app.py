@@ -12,6 +12,7 @@ try:
     import requests
 except Exception:
     requests = None
+import base64
 
 # =====================================
 # PAGE CONFIG (no emojis)
@@ -132,10 +133,10 @@ def resolve_style() -> str:
 # DATA LOAD
 # =====================================
 @st.cache_data
-def load_database():
-    """Carica il database con caching"""
+def load_database(csv_path: str, mtime: float):
+    """Carica il database con caching, invalida se cambia il file (mtime)."""
     try:
-        df = pd.read_csv('cosimo-film-visti-excel.csv', sep=';', encoding='cp1252')
+        df = pd.read_csv(csv_path, sep=';', encoding='cp1252')
         
         # Pulizia dati
         df['Rating_Clean'] = pd.to_numeric(df['Rating 10'].str.replace(',', '.'), errors='coerce')
@@ -172,6 +173,107 @@ def render_film_card(index=None, title="", director=None, year=None, rating=None
     """, unsafe_allow_html=True)
 
 # =====================================
+# CSV PATH + GITHUB SYNC HELPERS + RATING UTILS (needed by main and add-film)
+# =====================================
+def _get_csv_base_file() -> str:
+    """Return CSV path even if CSV_BASE_FILE is not yet defined."""
+    default_path = _get_secret("CSV_BASE_FILE", os.environ.get("CSV_BASE_FILE", 'cosimo-film-visti-excel.csv'))
+    return globals().get("CSV_BASE_FILE", default_path)
+
+def _resolved_csv_path() -> str:
+    try:
+        return os.path.abspath(_get_csv_base_file())
+    except Exception:
+        return _get_csv_base_file()
+
+def _can_write_csv() -> bool:
+    try:
+        target_dir = os.path.dirname(_resolved_csv_path()) or "."
+        return os.access(target_dir, os.W_OK)
+    except Exception:
+        return False
+
+def _gh_settings():
+    """Read GitHub sync configuration from secrets/env."""
+    token = _get_secret("GITHUB_TOKEN", os.environ.get("GITHUB_TOKEN"))
+    repo = _get_secret("GITHUB_REPO", os.environ.get("GITHUB_REPO"))  # e.g. user/repo
+    branch = _get_secret("GITHUB_BRANCH", os.environ.get("GITHUB_BRANCH")) or "main"
+    remote_path = _get_secret("GITHUB_FILE_PATH", os.environ.get("GITHUB_FILE_PATH")) or os.path.basename(_get_csv_base_file()) or "cosimo-film-visti-excel.csv"
+    return token, repo, branch, remote_path
+
+def _gh_enabled():
+    t, r, b, p = _gh_settings()
+    return bool(requests and t and r and p)
+
+def _gh_commit_local_csv(message: str):
+    """Commit local CSV to GitHub (contents API)."""
+    if not _gh_enabled():
+        return False, "github_sync_disabled"
+    token, repo, branch, remote_path = _gh_settings()
+    url = f"https://api.github.com/repos/{repo}/contents/{remote_path}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    try:
+        sha = None
+        r = requests.get(url, headers=headers, params={"ref": branch}, timeout=10)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+        elif r.status_code != 404:
+            return False, f"get_{r.status_code}"
+        with open(_get_csv_base_file(), "rb") as fh:
+            content_b64 = base64.b64encode(fh.read()).decode("utf-8")
+        payload = {"message": message, "content": content_b64, "branch": branch}
+        if sha:
+            payload["sha"] = sha
+        r = requests.put(url, headers=headers, json=payload, timeout=20)
+        if r.status_code in (200, 201):
+            return True, None
+        return False, f"put_{r.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+def _gh_pull_to_local():
+    """Pull CSV from GitHub and overwrite local file."""
+    if not _gh_enabled():
+        return False, "github_sync_disabled"
+    token, repo, branch, remote_path = _gh_settings()
+    url = f"https://api.github.com/repos/{repo}/contents/{remote_path}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    try:
+        r = requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
+        if r.status_code != 200:
+            return False, f"get_{r.status_code}"
+        content_b64 = r.json().get("content") or ""
+        raw = base64.b64decode(content_b64)
+        with open(_get_csv_base_file(), "wb") as fh:
+            fh.write(raw)
+        load_database.clear()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def _maybe_sync_to_github(action: str):
+    """Auto-sync if enabled in session state."""
+    if st.session_state.get("AUTO_GH_SYNC") and _gh_enabled():
+        ok, err = _gh_commit_local_csv(f"{action}: update CSV via app")
+        if not ok:
+            st.warning(f"Sync GitHub fallita: {err}")
+
+def _simplify_rating_10(v):
+    """Half-scale rating in 0.5 steps from a 0-10 input (e.g., 7.9 -> 3.5)."""
+    try:
+        f = float(v)
+    except Exception:
+        return np.nan
+    return np.floor((f / 2.0) * 2) / 2.0
+
+def _fmt_simplified(v):
+    """Format simplified rating with comma and drop .0."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return ""
+    f = float(v)
+    return str(int(f)) if f.is_integer() else str(f).replace('.', ',')
+
+# =====================================
 # MAIN
 # =====================================
 def main():
@@ -180,16 +282,13 @@ def main():
     # Header (no emojis)
     st.markdown('<h1 class="main-header">Database Cinematografico Cosimo</h1>', unsafe_allow_html=True)
     st.caption("App pronta")
-    # REMOVE visible theme selector - keep hidden switch only
 
-    # Carica dati
-    df = load_database()
+    # Carica dati dal file locale e invalida cache se cambia
+    csv_path = CSV_BASE_FILE if 'CSV_BASE_FILE' in globals() else 'cosimo-film-visti-excel.csv'
+    mtime = os.path.getmtime(csv_path) if os.path.exists(csv_path) else 0
+    df = load_database(csv_path, mtime)
 
-    if df.empty:
-        st.error("Impossibile caricare il database. Assicurati che il file CSV sia presente.")
-        return
-
-    # Sidebar per navigazione
+    # Sidebar minimale: solo titolo e selettore sezione
     st.sidebar.title("Menu Principale")
 
     menu = st.sidebar.selectbox(
@@ -202,8 +301,7 @@ def main():
             "Film in Compagnia",
             "Grafici e Statistiche",
             "Analisi Temporale",
-            "Aggiungi Film",  # NEW
-            "Metadati TMDb"  # existing
+            "Aggiungi Film"
         ]
     )
 
@@ -224,8 +322,6 @@ def main():
         show_temporal_analysis(df)
     elif menu == "Aggiungi Film":
         show_add_film()
-    elif menu == "Metadati TMDb":
-        show_tmdb_metadata(df)
 
 # =====================================
 # DASHBOARD (remove emojis + use helper)
@@ -944,310 +1040,13 @@ def show_temporal_analysis(df):
             </div>
             """, unsafe_allow_html=True)
 
-# --- TMDb helpers (safe key, cached calls) ---
-def _get_secret(key: str, default=None):
-    try:
-        return st.secrets[key]
-    except Exception:
-        return default
-
-def get_tmdb_api_key():
-    # NEW: prefer a session override set from the UI form
-    override = st.session_state.get("TMDB_API_KEY_OVERRIDE")
-    if override:
-        return override
-    return _get_secret("TMDB_API_KEY", os.environ.get("TMDB_API_KEY"))
-
-@st.cache_data(ttl=60*60*24)
-def tmdb_search_movie(api_key: str, title: str, year: Optional[int]):
-    if not requests:
-        return None, "missing_requests"
-    try:
-        def _call(params: dict):
-            return requests.get("https://api.themoviedb.org/3/search/movie", params=params, timeout=10)
-
-        def _best_match(results: list):
-            if not results:
-                return None
-            # score by year match and title similarity
-            best = None
-            best_score = -1
-            norm_title = (title or "").strip().lower()
-            for it in results:
-                score = 0
-                rd = (it.get("release_date") or "")
-                try:
-                    rd_year = int(rd[:4]) if len(rd) >= 4 else None
-                except Exception:
-                    rd_year = None
-                if year and rd_year and int(year) == rd_year:
-                    score += 5
-                t1 = (it.get("title") or "").strip().lower()
-                t2 = (it.get("original_title") or "").strip().lower()
-                if t1 == norm_title or t2 == norm_title:
-                    score += 4
-                if norm_title and (norm_title in t1 or norm_title in t2):
-                    score += 2
-                if it.get("popularity"):
-                    score += float(it.get("popularity")) * 0.01
-                if score > best_score:
-                    best_score = score
-                    best = it
-            return best
-
-        # try IT with year
-        params = {"api_key": api_key, "query": title, "include_adult": False, "language": "it-IT"}
-        if pd.notna(year):
-            params["year"] = int(year)
-        r = _call(params)
-        if r.status_code == 200:
-            data = r.json(); res = data.get("results", [])
-            hit = _best_match(res)
-            if hit:
-                return hit, None
-        # try IT without year
-        params.pop("year", None)
-        r = _call(params)
-        if r.status_code == 200:
-            data = r.json(); res = data.get("results", [])
-            hit = _best_match(res)
-            if hit:
-                return hit, None
-        # try EN with year
-        params_en = {"api_key": api_key, "query": title, "include_adult": False, "language": "en-US"}
-        if pd.notna(year):
-            params_en["year"] = int(year)
-        r = _call(params_en)
-        if r.status_code == 200:
-            data = r.json(); res = data.get("results", [])
-            hit = _best_match(res)
-            if hit:
-                return hit, None
-        # try EN without year
-        params_en.pop("year", None)
-        r = _call(params_en)
-        if r.status_code == 200:
-            data = r.json(); res = data.get("results", [])
-            hit = _best_match(res)
-            if hit:
-                return hit, None
-        return None, f"http_{r.status_code}" if r.status_code != 200 else None
-    except Exception as e:
-        return None, str(e)
-
-@st.cache_data(ttl=60*60*24)
-def tmdb_movie_details(api_key: str, tmdb_id: int):
-    if not requests:
-        return None, "missing_requests"
-    try:
-        # request only needed data; use en-US so genre names are in English
-        params = {"api_key": api_key, "language": "en-US", "append_to_response": "external_ids,alternative_titles"}
-        r = requests.get(f"https://api.themoviedb.org/3/movie/{tmdb_id}", params=params, timeout=10)
-        if r.status_code != 200:
-            return None, f"http_{r.status_code}"
-        return r.json(), None
-    except Exception as e:
-        return None, str(e)
-
-def _enrich_row_with_tmdb(api_key: str, row: pd.Series):
-    title = str(row.get("Name", "")).strip()
-    year = row.get("Year_Clean", None)
-    if not title:
-        return {}
-    hit, err = tmdb_search_movie(api_key, title, year if pd.notna(year) else None)
-    if err or not hit:
-        return {}
-    details, derr = tmdb_movie_details(api_key, hit.get("id"))
-    if derr or not details:
-        return {}
-
-    # Genres (English names via en-US)
-    genres = ", ".join([g.get("name", "") for g in details.get("genres", []) if g.get("name")])
-
-    # Countries (English names)
-    countries = ", ".join([c.get("name", "") for c in details.get("production_countries", []) if c.get("name")])
-
-    # Spoken languages (prefer English name)
-    def _lang_name(l):
-        return l.get("english_name") or l.get("name") or l.get("iso_639_1") or ""
-    languages = ", ".join([_lang_name(l) for l in details.get("spoken_languages", []) if _lang_name(l)])
-
-    tmdb_id = details.get("id")
-    tmdb_url = f"https://www.themoviedb.org/movie/{tmdb_id}" if tmdb_id else None
-
-    # Alternative titles (Title (CC)) limited to first 10
-    alt_raw = (details.get("alternative_titles") or {}).get("titles", [])
-    alt_list = []
-    for t in alt_raw:
-        tt = t.get("title")
-        cc = t.get("iso_3166_1")
-        if tt:
-            alt_list.append(f"{tt} ({cc})" if cc else tt)
-    alternative_titles = ", ".join(alt_list[:10]) if alt_list else None
-
-    return {
-        "TMDB_ID": tmdb_id,
-        "TMDB_URL": tmdb_url,
-        "TMDB_Genres": genres,
-        "TMDB_Production_Countries": countries,
-        "TMDB_Spoken_Languages": languages,
-        "TMDB_Alternative_Titles": alternative_titles,
-    }
-
-TMDB_ENRICH_COLS = [
-    "TMDB_ID",
-    "TMDB_URL",
-    "TMDB_Genres",
-    "TMDB_Production_Countries",
-    "TMDB_Spoken_Languages",
-    "TMDB_Alternative_Titles",
-]
-
-def load_detailed_database(path: str = "cosimo-film-visti-detailed.csv") -> pd.DataFrame:
-    if os.path.exists(path):
-        try:
-            return pd.read_csv(path, sep=";", encoding="utf-8")
-        except Exception:
-            try:
-                return pd.read_csv(path)
-            except Exception:
-                return pd.DataFrame()
-    return pd.DataFrame()
-
-def save_detailed_database(df: pd.DataFrame, path: str = "cosimo-film-visti-detailed.csv"):
-    # write with ; to match original style, utf-8 for extended chars
-    df.to_csv(path, index=False, sep=";", encoding="utf-8")
-
-# =====================================
-# TMDb METADATA (new section)
-# =====================================
-def show_tmdb_metadata(df: pd.DataFrame):
-    st.header("Metadati TMDb")
-    api_key = get_tmdb_api_key()
-    if not api_key:
-        st.error("TMDb API key non configurata.")
-        st.info("Imposta una chiave in .streamlit/secrets.toml (TMDB_API_KEY = \"...\") oppure come variabile d'ambiente TMDB_API_KEY.")
-        if not requests:
-            st.warning("Manca la libreria 'requests'. Installa con: pip install requests")
-
-        # NEW: inline form to use a key only for this session
-        with st.form("tmdb_key_form"):
-            tmp_key = st.text_input("Inserisci TMDb API key (solo per questa sessione)", type="password")
-            submitted = st.form_submit_button("Usa per questa sessione")
-        if submitted and tmp_key.strip():
-            st.session_state["TMDB_API_KEY_OVERRIDE"] = tmp_key.strip()
-            st.success("Chiave TMDb impostata per questa sessione. Ricarico la pagina...")
-            st.rerun()
-        return
-
-    st.write("Il database originale resterà intatto. Verrà creato/aggiornato un file arricchito: cosimo-film-visti-detailed.csv")
-    detailed_df = load_detailed_database()
-    st.write(f"Righe nel database arricchito: {len(detailed_df)}")
-
-    # Info: quali campi aggiungiamo
-    with st.expander("Quali campi TMDb vengono aggiunti?"):
-        st.write(", ".join(TMDB_ENRICH_COLS))
-
-    # Define a row key to match originals with enriched
-    def row_key(s: pd.Series):
-        y = int(s["Year_Clean"]) if pd.notna(s.get("Year_Clean")) else None
-        return f'{str(s.get("Name","")).strip().lower()}|{y}'
-
-    base = df.copy()
-    base["_key"] = base.apply(row_key, axis=1)
-    enriched = detailed_df.copy()
-    if not enriched.empty:
-        if "_key" not in enriched.columns:
-            # backfill keys for existing enriched file if absent
-            enriched["_key"] = enriched.apply(
-                lambda s: f'{str(s.get("Name","")).strip().lower()}|{int(s["Year_Clean"]) if pd.notna(s.get("Year_Clean")) else None}', axis=1
-            )
-
-    only_missing = st.checkbox("Arricchisci solo elementi mancanti", value=True)
-    max_rows = st.number_input("Limite righe da elaborare", min_value=1, max_value=1000, value=50, step=1)
-    do_enrich = st.button("Arricchisci ora")
-
-    if do_enrich:
-        if enriched.empty:
-            merged = base.copy()
-        else:
-            # inner join to carry over existing enrichment; left join to keep all base
-            merged = base.merge(enriched.drop_duplicates("_key"), on="_key", how="left", suffixes=("", "_OLD"))
-
-        # Determine rows to process
-        if only_missing:
-            to_process_mask = merged["TMDB_ID"].isna() if "TMDB_ID" in merged.columns else pd.Series([True]*len(merged))
-        else:
-            to_process_mask = pd.Series([True]*len(merged))
-        to_process_idx = merged[to_process_mask].index.tolist()[: int(max_rows)]
-
-        progress = st.progress(0)
-        status = st.empty()
-        updated_rows = 0
-
-        for i, idx in enumerate(to_process_idx, start=1):
-            row = merged.loc[idx]
-            payload = _enrich_row_with_tmdb(api_key, row)
-            if payload:
-                # attach payload into row
-                for k, v in payload.items():
-                    merged.at[idx, k] = v
-                updated_rows += 1
-            progress.progress(int(i*100/len(to_process_idx)))
-            status.write(f"Elaborazione {i}/{len(to_process_idx)}")
-
-            # small pause to be gentle with API limits
-            time.sleep(0.10)
-
-        # Persist enriched file: keep original columns + enrichment
-        # Rebuild a clean output df: merge base with enriched columns
-        enrich_cols_present = [c for c in TMDB_ENRICH_COLS if c in merged.columns]
-        output_cols = [c for c in base.columns if c != "_key"] + ["_key"] + enrich_cols_present
-        out_df = merged[output_cols].copy()
-        save_detailed_database(out_df)
-        st.success(f"Aggiornamento completato. Righe aggiornate: {updated_rows}. File: cosimo-film-visti-detailed.csv")
-
-        # NEW: show which columns are newly added and refresh preview
-        base_cols_set = set(df.columns) | {"_key"}
-        new_cols = [c for c in out_df.columns if c not in base_cols_set]
-        if new_cols:
-            st.info(f"Colonne TMDb presenti nel file arricchito: {', '.join(new_cols)}")
-        # refresh preview with current result
-        detailed_df = out_df
-
-        # Optional: preview only TMDb columns
-        show_only_tmdb = st.checkbox("Mostra solo colonne TMDb nella preview", value=True)
-        preview_cols = (["Name","Year_Clean"] + new_cols) if show_only_tmdb else list(detailed_df.columns)
-        st.dataframe(detailed_df.tail(10)[preview_cols], use_container_width=True)
-
-    # Preview both
-    with st.expander("Anteprima database originale (prime 10 righe)"):
-        st.dataframe(df.head(10), use_container_width=True)
-    with st.expander("Anteprima database arricchito (prime 10 righe)"):
-        st.dataframe(detailed_df.head(10) if not detailed_df.empty else pd.DataFrame(), use_container_width=True)
-
 # =====================================
 # ADD FILM FEATURE
 # =====================================
-CSV_BASE_FILE = 'cosimo-film-visti-excel.csv'
+CSV_BASE_FILE = _get_secret("CSV_BASE_FILE", os.environ.get("CSV_BASE_FILE", 'cosimo-film-visti-excel.csv'))
 
 from math import floor
 import io
-
-def _simplify_rating_10(r10: float) -> float:
-    if r10 is None or pd.isna(r10):
-        return None
-    half = r10 / 2.0
-    # floor to nearest 0.5
-    return floor(half * 2) / 2.0
-
-def _fmt_simplified(val: float) -> str:
-    if val is None or pd.isna(val):
-        return ""
-    if val.is_integer():
-        return str(int(val))
-    # use comma as in existing CSV
-    return str(val).replace('.', ',')
 
 def _append_film_row(row_dict: dict):
     # Ensure order matches existing header
@@ -1263,16 +1062,18 @@ def _append_film_row(row_dict: dict):
         v = row_dict.get(h, "")
         if v is None:
             v = ""
-        # convert to str and ensure no stray semicolons
         vs = str(v).replace('\n',' ').replace('\r',' ').replace(';', ',')
         values.append(vs)
     line = ';'.join(values) + '\n'
     with open(CSV_BASE_FILE, 'a', encoding='cp1252', newline='') as f:
         f.write(line)
+    # NEW: auto-sync to GitHub if enabled
+    _maybe_sync_to_github("append_row")
 
 def show_add_film():
     st.header("Aggiungi Film")
-
+    st.info(f"I nuovi film vengono salvati su: {_resolved_csv_path()}")
+    
     tab_manual, tab_bulk = st.tabs(["Manuale", "Importa in blocco"])
 
     with tab_bulk:
@@ -1288,9 +1089,7 @@ def show_add_film():
 
         uploaded = st.file_uploader("Carica file (CSV o Excel)", type=["csv","xlsx"], accept_multiple_files=False)
         dup_policy = st.radio("Gestione duplicati (Titolo + Anno)", ["Salta", "Sovrascrivi", "Permetti duplicati"], index=0, horizontal=True)
-        do_enrich = st.checkbox("Arricchisci con TMDb dopo l'import", value=False)
-        enrich_limit = st.number_input("Limite arricchimenti TMDb (per evitare tempi lunghi)", min_value=1, max_value=500, value=50, step=1)
-
+        
         def _read_upload(file):
             name = file.name.lower()
             if name.endswith('.xlsx'):
@@ -1427,46 +1226,14 @@ def show_add_film():
                         out.to_csv(CSV_BASE_FILE, sep=';', index=False, encoding='cp1252')
                         load_database.clear()
                         st.success(f"Import completato. Aggiunti: {added}, Aggiornati: {updated}, Saltati: {skipped}")
+                        _maybe_sync_to_github(f"bulk_import +{added}/~{len(prep)}")
                     except Exception as e:
                         st.error(f"Errore scrittura CSV base: {e}")
                         st.stop()
 
-                    # Optional enrichment
-                    if do_enrich:
-                        api_key = get_tmdb_api_key()
-                        if not api_key:
-                            st.info("TMDb API key non presente. Puoi arricchire in seguito dalla sezione dedicata.")
-                        else:
-                            # prepare minimal rows to enrich
-                            rows_for_enrich = prep.head(int(enrich_limit))
-                            enriched_count = 0
-                            det = load_detailed_database()
-                            if not det.empty and '_key' not in det.columns:
-                                det['_key'] = det.apply(lambda s: f"{str(s.get('Name','')).strip().lower()}|{int(s['Year_Clean']) if pd.notna(s.get('Year_Clean')) else None}", axis=1)
-                            for _, r in rows_for_enrich.iterrows():
-                                ser = pd.Series({'Name': r['Name'], 'Year_Clean': int(r['Year']) if pd.notna(r['Year']) else None})
-                                payload = _enrich_row_with_tmdb(api_key, ser)
-                                if payload:
-                                    new_row = r.to_dict()
-                                    new_row['Year_Clean'] = new_row['Year']
-                                    new_row['_key'] = f"{str(new_row['Name']).strip().lower()}|{int(new_row['Year']) if pd.notna(new_row['Year']) else None}"
-                                    for k,v in payload.items():
-                                        new_row[k] = v
-                                    if det.empty:
-                                        det = pd.DataFrame([new_row])
-                                    else:
-                                        det = pd.concat([det, pd.DataFrame([new_row])], ignore_index=True)
-                                    enriched_count += 1
-                                    time.sleep(0.1)
-                            try:
-                                save_detailed_database(det)
-                                st.success(f"Arricchimento TMDb completato per {enriched_count} righe")
-                            except Exception as e:
-                                st.error(f"Errore salvataggio file arricchito: {e}")
-
     # Manual tab (existing form)
     with tab_manual:
-        st.info("Compila il form per aggiungere un film al database base (CSV). Dopo il salvataggio puoi opzionalmente arricchirlo con TMDb.")
+        st.info("Compila il form per aggiungere un film al database base (CSV).")
         # Audit existing ratings
         with st.expander("Verifica discrepanze rating esistenti"):
             if st.button("Analizza rating", key="audit_ratings_btn"):
@@ -1483,6 +1250,7 @@ def show_add_film():
                     else:
                         st.warning(f"Discrepanze trovate: {len(mismatches)}")
                         show_cols = ['Name','Year','Rating','Rating 10']
+                       
                         mismatches['Expected_Rating'] = expected[mismatch_mask]
                         mismatches['Expected_Rating_Display'] = mismatches['Expected_Rating'].apply(_fmt_simplified)
                         st.dataframe(mismatches[show_cols + ['Expected_Rating_Display']].head(30), use_container_width=True)
@@ -1492,6 +1260,8 @@ def show_add_film():
                             df_a.to_csv(CSV_BASE_FILE, sep=';', index=False, encoding='cp1252')
                             load_database.clear()
                             st.success("Rating corretti e file aggiornato.")
+                            # NEW: auto-sync after fixing ratings
+                            _maybe_sync_to_github("fix_ratings")
                 except Exception as e:
                     st.error(f"Errore analisi: {e}")
 
@@ -1507,7 +1277,6 @@ def show_add_film():
                 tag_diario = st.text_input("Tag Diario", "")
             with col3:
                 rating10 = st.number_input("Rating 10 (0-10)", min_value=0.0, max_value=10.0, value=0.0, step=0.5)
-                enrich_now = st.checkbox("Arricchisci subito con TMDb (se chiave disponibile)", value=True)
                 allow_duplicate = st.checkbox("Permetti duplicato (stesso titolo+anno)", value=False)
             submitted = st.form_submit_button("Salva Film")
 
@@ -1529,6 +1298,7 @@ def show_add_film():
             # compute simplified rating
             simplified = _simplify_rating_10(rating10)
             simplified_str = _fmt_simplified(simplified)
+
             rating10_str = (str(rating10).replace('.', ','))
             watch_date_str = watched_date.strftime('%d/%m/%Y') if watched_date else ""
             greatness = 1 if rating10 >= 7.5 else 0
@@ -1552,40 +1322,10 @@ def show_add_film():
                 st.error(f"Errore salvataggio film: {e}")
                 return
 
-            # Optional immediate enrichment
-            if enrich_now:
-                api_key = get_tmdb_api_key()
-                if not api_key:
-                    st.info("Nessuna TMDb API key disponibile: arricchisci più tardi nella sezione Metadati TMDb.")
-                else:
-                    # Build minimal Series matching expectations
-                    ser = pd.Series({
-                        'Name': row['Name'],
-                        'Year_Clean': row['Year'],
-                    })
-                    payload = _enrich_row_with_tmdb(api_key, ser)
-                    if payload:
-                        # Load / update detailed file
-                        detailed = load_detailed_database()
-                        base_new = pd.DataFrame([row])
-                        # Add computed clean columns to base_new for key building later
-                        base_new['Rating 10'] = base_new['Rating 10']
-                        base_new['Year_Clean'] = base_new['Year']
-                        base_new['_key'] = f"{row['Name'].strip().lower()}|{row['Year']}"
-                        for k,v in payload.items():
-                            base_new[k] = v
-                        if detailed.empty:
-                            # start new
-                            save_detailed_database(base_new)
-                        else:
-                            if '_key' not in detailed.columns:
-                                detailed['_key'] = detailed.apply(lambda s: f"{str(s.get('Name','')).strip().lower()}|{int(s['Year_Clean']) if pd.notna(s.get('Year_Clean')) else None}", axis=1)
-                            updated = pd.concat([detailed, base_new], ignore_index=True)
-                            save_detailed_database(updated)
-                        st.success("Arricchimento TMDb completato per il film aggiunto")
-                    else:
-                        st.info("Nessun dato TMDb trovato ora; puoi riprovare in seguito.")
-
             # Show the row just added
             st.subheader("Anteprima nuova riga")
             st.dataframe(pd.DataFrame([row]), use_container_width=True)
+
+# Ensure the app renders by calling main()
+if __name__ == "__main__":
+    main()
