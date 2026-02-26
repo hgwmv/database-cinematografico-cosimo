@@ -290,12 +290,18 @@ def _gh_pull_to_local():
     except Exception as e:
         return False, str(e)
 
-def _maybe_sync_to_github(action: str):
-    """Auto-sync if enabled in session state."""
-    if st.session_state.get("AUTO_GH_SYNC") and _gh_enabled():
+def _maybe_sync_to_github(action: str, show_feedback: bool = False):
+    """Auto-sync tentativo diretto su GitHub. Se configurato, il push è automatico."""
+    if _gh_enabled():
         ok, err = _gh_commit_local_csv(f"{action}: update CSV via app")
-        if not ok:
-            st.warning(f"Sync GitHub fallita: {err}")
+        if ok:
+            if show_feedback:
+                st.success("✅ Film sincronizzato su GitHub")
+        else:
+            if show_feedback:
+                st.warning(f"Sync GitHub fallita: {err}")
+    # Se GitHub non è configurato, il file rimane salvato localmente
+    # (non mostriamo errori per non confondere l'utente)
 
 def _simplify_rating_10(v):
     """Half-scale rating in 0.5 steps from a 0-10 input (e.g., 7.9 -> 3.5)."""
@@ -1109,8 +1115,6 @@ def _append_film_row(row_dict: dict):
     line = ';'.join(values) + '\n'
     with open(CSV_BASE_FILE, 'a', encoding='cp1252', newline='') as f:
         f.write(line)
-    # NEW: auto-sync to GitHub if enabled
-    _maybe_sync_to_github("append_row")
 
 def show_add_film():
     st.header("Aggiungi Film")
@@ -1273,7 +1277,7 @@ def show_add_film():
                         out.to_csv(CSV_BASE_FILE, sep=';', index=False, encoding='cp1252')
                         load_database.clear()
                         st.success(f"Import completato. Aggiunti: {added}, Aggiornati: {updated}, Saltati: {skipped}")
-                        _maybe_sync_to_github(f"bulk_import +{added}/~{len(prep)}")
+                        _maybe_sync_to_github(f"bulk_import +{added}/~{len(prep)}", show_feedback=True)
                     except Exception as e:
                         st.error(f"Errore scrittura CSV base: {e}")
                         st.stop()
@@ -1308,7 +1312,7 @@ def show_add_film():
                             load_database.clear()
                             st.success("Rating corretti e file aggiornato.")
                             # NEW: auto-sync after fixing ratings
-                            _maybe_sync_to_github("fix_ratings")
+                            _maybe_sync_to_github("fix_ratings", show_feedback=True)
                 except Exception as e:
                     st.error(f"Errore analisi: {e}")
 
@@ -1365,6 +1369,8 @@ def show_add_film():
                 _append_film_row(row)
                 load_database.clear()
                 st.success("Film aggiunto al CSV base")
+                # Tentativo sync automatico
+                _maybe_sync_to_github("add_film", show_feedback=True)
             except Exception as e:
                 st.error(f"Errore salvataggio film: {e}")
                 return
