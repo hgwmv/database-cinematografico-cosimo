@@ -340,7 +340,8 @@ def main():
             "Film in Compagnia",
             "Grafici e Statistiche",
             "Analisi Temporale",
-            "Aggiungi Film"
+            "Aggiungi Film",
+            "Sincronizzazione GitHub"
         ]
     )
 
@@ -361,6 +362,8 @@ def main():
         show_temporal_analysis(df)
     elif menu == "Aggiungi Film":
         show_add_film()
+    elif menu == "Sincronizzazione GitHub":
+        show_github_sync()
 
 # =====================================
 # DASHBOARD (remove emojis + use helper)
@@ -1369,6 +1372,163 @@ def show_add_film():
             # Show the row just added
             st.subheader("Anteprima nuova riga")
             st.dataframe(pd.DataFrame([row]), use_container_width=True)
+
+# =====================================
+# GITHUB SYNC
+# =====================================
+def show_github_sync():
+    """Sezione per gestire la sincronizzazione con GitHub"""
+    st.header("Sincronizzazione GitHub")
+    
+    # Check GitHub configuration
+    token, repo, branch, remote_path = _gh_settings()
+    gh_enabled = _gh_enabled()
+    
+    # Status configuration
+    st.subheader("Stato Configurazione")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(f"**Repository:** {repo if repo else '❌ Non configurato'}")
+        st.markdown(f"**Branch:** {branch if branch else 'main'}")
+    with col2:
+        st.markdown(f"**File remoto:** {remote_path if remote_path else 'cosimo-film-visti-excel.csv'}")
+        st.markdown(f"**File locale:** {_resolved_csv_path()}")
+    
+    if token:
+        st.success("✅ Token GitHub configurato")
+    else:
+        st.error("❌ Token GitHub non configurato")
+        st.info("Per abilitare la sincronizzazione, configura i secrets: GITHUB_TOKEN, GITHUB_REPO")
+    
+    if not gh_enabled:
+        st.warning("Sincronizzazione GitHub disabilitata. Configura i secrets per abilitarla.")
+        return
+    
+    st.divider()
+    
+    # Auto-sync toggle
+    st.subheader("Auto-Sincronizzazione")
+    auto_sync = st.session_state.get("AUTO_GH_SYNC", False)
+    new_auto_sync = st.checkbox(
+        "Abilita sincronizzazione automatica",
+        value=auto_sync,
+        help="Se abilitato, ogni modifica al database verrà automaticamente salvata su GitHub"
+    )
+    if new_auto_sync != auto_sync:
+        st.session_state["AUTO_GH_SYNC"] = new_auto_sync
+        if new_auto_sync:
+            st.success("Auto-sincronizzazione abilitata")
+        else:
+            st.info("Auto-sincronizzazione disabilitata")
+    
+    st.divider()
+    
+    # Manual sync operations
+    st.subheader("Operazioni Manuali")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("**Push su GitHub**")
+        st.caption("Carica il file CSV locale su GitHub")
+        commit_msg = st.text_input("Messaggio commit", value="Manual sync from app", key="commit_msg")
+        if st.button("📤 Push su GitHub", type="primary", use_container_width=True):
+            with st.spinner("Sincronizzazione in corso..."):
+                ok, err = _gh_commit_local_csv(commit_msg)
+                if ok:
+                    st.success("✅ CSV caricato su GitHub con successo!")
+                else:
+                    st.error(f"❌ Errore durante il push: {err}")
+    
+    with col2:
+        st.markdown("**Pull da GitHub**")
+        st.caption("Scarica il file CSV da GitHub")
+        st.warning("⚠️ Sovrascriverà il file locale")
+        if st.button("📥 Pull da GitHub", use_container_width=True):
+            with st.spinner("Download in corso..."):
+                ok, err = _gh_pull_to_local()
+                if ok:
+                    st.success("✅ CSV scaricato da GitHub con successo!")
+                    st.info("Ricarica la pagina per vedere i dati aggiornati")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Errore durante il pull: {err}")
+    
+    with col3:
+        st.markdown("**Download Locale**")
+        st.caption("Scarica una copia del CSV locale")
+        try:
+            with open(_get_csv_base_file(), 'rb') as f:
+                csv_data = f.read()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"backup_cosimo_film_{timestamp}.csv"
+            st.download_button(
+                "💾 Scarica backup",
+                data=csv_data,
+                file_name=filename,
+                mime="text/csv",
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f"Errore lettura file: {e}")
+    
+    st.divider()
+    
+    # File info
+    st.subheader("Informazioni File")
+    try:
+        csv_path = _get_csv_base_file()
+        if os.path.exists(csv_path):
+            file_size = os.path.getsize(csv_path)
+            file_mtime = datetime.fromtimestamp(os.path.getmtime(csv_path))
+            
+            # Count entries
+            try:
+                df_info = pd.read_csv(csv_path, sep=';', encoding='cp1252')
+                num_entries = len(df_info)
+            except Exception:
+                num_entries = "?"
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Numero film", num_entries)
+            with col2:
+                st.metric("Dimensione file", f"{file_size / 1024:.1f} KB")
+            with col3:
+                st.metric("Ultima modifica", file_mtime.strftime("%d/%m/%Y %H:%M"))
+        else:
+            st.warning("File CSV non trovato")
+    except Exception as e:
+        st.error(f"Errore lettura info file: {e}")
+    
+    st.divider()
+    
+    # Help section
+    with st.expander("ℹ️ Guida alla sincronizzazione"):
+        st.markdown("""
+        ### Come configurare la sincronizzazione GitHub
+        
+        1. **Crea un Personal Access Token su GitHub:**
+           - Vai su GitHub → Settings → Developer settings → Personal access tokens
+           - Crea un token con permessi `repo`
+        
+        2. **Configura i secrets in Streamlit Cloud:**
+           - `GITHUB_TOKEN`: il tuo personal access token
+           - `GITHUB_REPO`: formato `username/repository` (es: `hgwmv/database-cinematografico-cosimo`)
+           - `GITHUB_BRANCH`: branch da usare (default: `main`)
+           - `GITHUB_FILE_PATH`: percorso del file nel repo (default: `cosimo-film-visti-excel.csv`)
+        
+        3. **Modalità di sincronizzazione:**
+           - **Auto-sync:** Ogni modifica viene automaticamente salvata su GitHub
+           - **Push manuale:** Carica il file locale su GitHub quando vuoi
+           - **Pull manuale:** Scarica la versione da GitHub (utile per sincronizzare tra dispositivi)
+        
+        ### Risoluzione problemi
+        
+        - Se il push fallisce, verifica che il token abbia i permessi corretti
+        - Se vedi "github_sync_disabled", controlla la configurazione dei secrets
+        - Il pull sovrascrive il file locale: fai prima un backup se necessario
+        """)
 
 # Ensure the app renders by calling main()
 if __name__ == "__main__":
