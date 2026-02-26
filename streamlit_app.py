@@ -1120,7 +1120,7 @@ def show_add_film():
     st.header("Aggiungi Film")
     st.info(f"I nuovi film vengono salvati su: {_resolved_csv_path()}")
     
-    tab_manual, tab_bulk = st.tabs(["Manuale", "Importa in blocco"])
+    tab_manual, tab_bulk, tab_edit = st.tabs(["Manuale", "Importa in blocco", "Modifica Film"])
 
     with tab_bulk:
         st.subheader("Importa da CSV/Excel")
@@ -1281,6 +1281,114 @@ def show_add_film():
                     except Exception as e:
                         st.error(f"Errore scrittura CSV base: {e}")
                         st.stop()
+
+    # Edit tab
+    with tab_edit:
+        st.info("Cerca e modifica film esistenti nel database")
+        
+        # Load current database
+        try:
+            df_edit = pd.read_csv(CSV_BASE_FILE, sep=';', encoding='cp1252')
+        except Exception as e:
+            st.error(f"Errore lettura database: {e}")
+            df_edit = pd.DataFrame()
+        
+        if df_edit.empty:
+            st.warning("Database vuoto")
+        else:
+            # Search for film
+            search_type = st.radio("Cerca per:", ["Titolo", "Titolo + Anno"], horizontal=True, key="search_type_edit")
+            
+            if search_type == "Titolo":
+                search_title = st.text_input("Titolo del film", key="search_title")
+                if search_title:
+                    mask = df_edit['Name'].astype(str).str.lower().str.contains(search_title.lower(), na=False)
+                    results = df_edit[mask]
+                else:
+                    results = pd.DataFrame()
+            else:
+                col1, col2 = st.columns(2)
+                with col1:
+                    search_title = st.text_input("Titolo", key="search_title_year")
+                with col2:
+                    search_year = st.number_input("Anno", min_value=1888, max_value=2100, value=2020, step=1, key="search_year_edit")
+                
+                mask = (df_edit['Name'].astype(str).str.lower().str.contains(search_title.lower(), na=False)) if search_title else [True] * len(df_edit)
+                results = df_edit[mask & (pd.to_numeric(df_edit['Year'], errors='coerce') == search_year)]
+            
+            if not results.empty:
+                st.write(f"Trovati {len(results)} film(i)")
+                
+                # Select which film to edit
+                if len(results) > 1:
+                    selected_idx = st.selectbox(
+                        "Seleziona il film da modificare:",
+                        range(len(results)),
+                        format_func=lambda i: f"{results.iloc[i]['Name']} ({int(results.iloc[i]['Year'])})",
+                        key="select_film_edit"
+                    )
+                else:
+                    selected_idx = 0
+                
+                selected_film = results.iloc[selected_idx]
+                original_idx = results.index[selected_idx]
+                
+                st.subheader(f"Modifica: {selected_film['Name']}")
+                
+                # Edit form
+                with st.form("edit_film_form", clear_on_submit=False):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        new_name = st.text_input("Titolo", value=selected_film['Name'])
+                        new_year = st.number_input("Anno", min_value=1888, max_value=2100, value=int(selected_film['Year']), step=1)
+                        new_duration = st.number_input("Durata (min)", min_value=1, max_value=1000, value=int(selected_film['Duration']), step=1)
+                    with col2:
+                        new_director = st.text_input("Regista", value=selected_film['Director'] if pd.notna(selected_film['Director']) else "")
+                        watched_str = selected_film['Watched Date'] if pd.notna(selected_film['Watched Date']) and selected_film['Watched Date'] else None
+                        if watched_str:
+                            try:
+                                watched_date = datetime.strptime(watched_str, '%d/%m/%Y').date()
+                            except:
+                                watched_date = datetime.now().date()
+                        else:
+                            watched_date = datetime.now().date()
+                        new_watched_date = st.date_input("Data visione", value=watched_date, format="DD/MM/YYYY")
+                        new_tag_diario = st.text_input("Tag Diario", value=selected_film['Tag Diario'] if pd.notna(selected_film['Tag Diario']) else "")
+                    with col3:
+                        rating10_val = float(selected_film['Rating 10'].astype(str).str.replace(',', '.')) if pd.notna(selected_film['Rating 10']) else 0.0
+                        new_rating10 = st.number_input("Rating 10 (0-10)", min_value=0.0, max_value=10.0, value=rating10_val, step=0.5)
+                    
+                    submitted = st.form_submit_button("Salva Modifiche", type="primary")
+                
+                if submitted:
+                    # Compute simplified rating
+                    simplified = _simplify_rating_10(new_rating10)
+                    simplified_str = _fmt_simplified(simplified)
+                    rating10_str = str(new_rating10).replace('.', ',')
+                    watch_date_str = new_watched_date.strftime('%d/%m/%Y')
+                    greatness = 1 if new_rating10 >= GREAT_MOVIE_MIN_RATING else 0
+                    
+                    # Update dataframe
+                    df_edit.loc[original_idx, 'Name'] = new_name.strip()
+                    df_edit.loc[original_idx, 'Year'] = int(new_year)
+                    df_edit.loc[original_idx, 'Rating'] = simplified_str
+                    df_edit.loc[original_idx, 'Rating 10'] = rating10_str
+                    df_edit.loc[original_idx, 'Duration'] = int(new_duration)
+                    df_edit.loc[original_idx, 'Director'] = new_director.strip()
+                    df_edit.loc[original_idx, 'Watched Date'] = watch_date_str
+                    df_edit.loc[original_idx, 'Tag Diario'] = new_tag_diario.strip()
+                    df_edit.loc[original_idx, 'Greatness'] = greatness
+                    
+                    # Save to CSV
+                    try:
+                        df_edit.to_csv(CSV_BASE_FILE, sep=';', index=False, encoding='cp1252')
+                        load_database.clear()
+                        st.success(f"Film '{new_name}' modificato con successo")
+                        _maybe_sync_to_github("edit_film", show_feedback=True)
+                    except Exception as e:
+                        st.error(f"Errore salvataggio: {e}")
+            else:
+                st.info("Nessun film trovato con questi criteri")
 
     # Manual tab (existing form)
     with tab_manual:
